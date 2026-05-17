@@ -1,7 +1,8 @@
 /*
- * PIUIO interface driver
+ * PIUIO / LXIO interface driver
  *
  * Copyright (C) 2012-2014 Devin J. Pohly (djpohly+linux@gmail.com)
+ * LXIO V1/V2 support additions
  *
  *	This program is free software; you can redistribute it and/or
  *	modify it under the terms of the GNU General Public License as
@@ -33,13 +34,19 @@
 #define USB_VENDOR_ID_BTNBOARD 0x0d2f
 #define USB_PRODUCT_ID_BTNBOARD 0x1010
 
+#define USB_VENDOR_ID_LXIO 0x0d2f
+#define USB_PRODUCT_ID_LXIO_V1 0x1020
+#define USB_PRODUCT_ID_LXIO_V2 0x1040
+
 /* USB message used to communicate with the device */
 #define PIUIO_MSG_REQ 0xae
 #define PIUIO_MSG_VAL 0
 #define PIUIO_MSG_IDX 0
 
 #define PIUIO_MSG_SZ 8
-#define PIUIO_MSG_LONGS (PIUIO_MSG_SZ / sizeof(unsigned long))
+#define LXIO_MSG_SZ 16
+#define PIUIO_MAX_MSG_SZ 16
+#define PIUIO_MSG_LONGS (PIUIO_MAX_MSG_SZ / sizeof(unsigned long))
 
 /* Input keycode ranges */
 #define PIUIO_BTN_REG BTN_JOYSTICK
@@ -66,6 +73,7 @@ struct piuio_led {
  * @outputs:	Number of output pins
  * @mplex:	Number of sets of inputs
  * @mplex_bits:	Number of output bits reserved for multiplexing
+ * @msg_sz:	Size of USB message/report in bytes
  */
 struct piuio_devtype {
 	const char **led_names;
@@ -73,27 +81,28 @@ struct piuio_devtype {
 	int outputs;
 	int mplex;
 	int mplex_bits;
+	int msg_sz;
 };
 
 /**
  * struct piuio - state of each attached PIUIO
- * @type:	Type of PIUIO device (currently either full or buttonboard)
+ * @type:	Type of PIUIO device
  * @idev:	Input device associated with this PIUIO
  * @phys:	Physical path of the device. @idev's phys field points to this
  *		buffer
  * @udev:	USB device associated with this PIUIO
  * @in:		URB for requesting the current state of one set of inputs
  * @out:	URB for sending data to outputs and multiplexer
- * @cr_in:	Setup packet for @in URB
- * @cr_out:	Setup packet for @out URB
+ * @cr_in:	Setup packet for @in URB (PIUIO mode)
+ * @cr_out:	Setup packet for @out URB (PIUIO mode)
  * @old_inputs:	Previous state of input pins from the @in URB for each of the
- *		input sets.  These are used to determine when a press or release
- *		has happened for a group of correlated inputs.
+ *		input sets (PIUIO mode).  For LXIO mode: previous button bitmask.
  * @inputs:	Buffer for the @in URB
  * @outputs:	Buffer for the @out URB
  * @new_outputs:
  * 		Staging for the @outputs buffer
  * @set:	Current set of inputs to read (0 .. @type->mplex - 1)
+ * @is_lxio:	True if this is an LXIO (HID interrupt) device
  */
 struct piuio {
 	struct piuio_devtype *type;
@@ -108,12 +117,13 @@ struct piuio {
 
 	unsigned long (*old_inputs)[PIUIO_MSG_LONGS];
 	unsigned long inputs[PIUIO_MSG_LONGS];
-	unsigned char outputs[PIUIO_MSG_SZ];
-	unsigned char new_outputs[PIUIO_MSG_SZ];
+	unsigned char outputs[PIUIO_MAX_MSG_SZ];
+	unsigned char new_outputs[PIUIO_MAX_MSG_SZ];
 
 	struct piuio_led *led;
 
 	int set;
+	bool is_lxio;
 };
 
 static const char *led_names[] = {
@@ -178,6 +188,25 @@ static const char *bbled_names[] = {
 	"piuio::bboutput7",
 };
 
+static const char *lxio_led_names[] = {
+	"piuio::lamp0",
+	"piuio::lamp1",
+	"piuio::lamp2",
+	"piuio::lamp3",
+	"piuio::lamp4",
+	"piuio::lamp5",
+	"piuio::lamp6",
+	"piuio::lamp7",
+	"piuio::lamp8",
+	"piuio::lamp9",
+	"piuio::lamp10",
+	"piuio::lamp11",
+	"piuio::lamp12",
+	"piuio::lamp13",
+	"piuio::lamp14",
+	"piuio::lamp15",
+};
+
 /* Full device parameters */
 static struct piuio_devtype piuio_dev_full = {
 	.led_names = led_names,
@@ -185,6 +214,7 @@ static struct piuio_devtype piuio_dev_full = {
 	.outputs = 48,
 	.mplex = 4,
 	.mplex_bits = 2,
+	.msg_sz = PIUIO_MSG_SZ,
 };
 
 /* Button board device parameters */
@@ -194,6 +224,17 @@ static struct piuio_devtype piuio_dev_bb = {
 	.outputs = 8,
 	.mplex = 1,
 	.mplex_bits = 0,
+	.msg_sz = PIUIO_MSG_SZ,
+};
+
+/* LXIO V1/V2 device parameters */
+static struct piuio_devtype piuio_dev_lxio = {
+	.led_names = lxio_led_names,
+	.inputs = 96,
+	.outputs = ARRAY_SIZE(lxio_led_names),
+	.mplex = 1,
+	.mplex_bits = 0,
+	.msg_sz = LXIO_MSG_SZ,
 };
 
 
@@ -207,6 +248,48 @@ static int keycode(unsigned int pin)
 		return PIUIO_BTN_REG + pin;
 	pin -= PIUIO_NUM_REG;
 	return PIUIO_BTN_EXTRA + pin;
+}
+
+/*
+ * LXIO keycode mapping
+ *
+ * The LXIO 16-byte HID report uses active-low signaling. Several byte
+ * positions are duplicates or unused, so we skip them to avoid reporting
+ * duplicate key events or events from stale data.
+ *
+ * Meaningful byte positions:
+ *   Byte 0  (bits 0-7):   Pad 1 panel sensors
+ *   Byte 4  (bits 32-39):  Pad 2 panel sensors
+ *   Byte 8  (bits 64-71):  Pad 1 coin/aux
+ *   Byte 9  (bits 72-79):  Pad 2 coin/aux
+ *   Bytes 10-11 (bits 80-95):  Front buttons
+ *
+ * Duplicate/unused:
+ *   Bytes 1-3   (bits 8-31):    Duplicate of byte 0 (maybe history data?)
+ *   Bytes 5-7   (bits 40-63):   Duplicate of byte 4 (^)
+ *   Bytes 12-15 (bits 96+):     Unused/stale
+ */
+static int lxio_keycode(unsigned int pin)
+{
+	/* Skip duplicate bytes 1-3, 5-7 and unused bytes 12-15 */
+	if ((pin >= 8 && pin < 32) ||
+	    (pin >= 40 && pin < 64) ||
+	    pin >= 96)
+		return 0;
+
+	/* Compact sparse pin ranges into continuous keycode space:
+	 *   Raw pin:  0-7, 32-39, 64-71, 72-79, 80-95
+	 *   Compact:  0-7,  8-15, 16-23, 24-31, 32-47
+	 */
+	if (pin >= 80)
+		pin -= 48;	/* 80-95  → 32-47 */
+	else if (pin >= 64)
+		pin -= 48;	/* 64-79  → 16-31 */
+	else if (pin >= 32)
+		pin -= 24;	/* 32-39  → 8-15  */
+	/* 0-7 stays as 0-7 */
+
+	return keycode(pin);
 }
 
 
@@ -279,7 +362,7 @@ static void piuio_out_completed(struct urb *urb)
 	}
 
 	/* Copy in the new outputs */
-	memcpy(piu->outputs, piu->new_outputs, PIUIO_MSG_SZ);
+	memcpy(piu->outputs, piu->new_outputs, piu->type->msg_sz);
 
 	/* If we have a multiplexer, switch to the next input set in rotation
 	 * and set the appropriate output bits */
@@ -290,7 +373,7 @@ static void piuio_out_completed(struct urb *urb)
 	piu->outputs[0] |= piu->set;
 	piu->outputs[2] &= ~((1 << piu->type->mplex_bits) - 1);
 	piu->outputs[2] |= piu->set;
-	
+
 resubmit:
 	ret = usb_submit_urb(piu->out, GFP_ATOMIC);
 	if (ret == -EPERM)
@@ -299,6 +382,85 @@ resubmit:
 		dev_err(&piu->udev->dev, "piuio resubmit(out): error %d\n", ret);
 
 	/* Let any waiting threads know we're done here */
+	wake_up(&piu->shutdown_wait);
+}
+
+/*
+ * LXIO IN interrupt completion
+ *
+ * Extract button states from the 16-byte HID input report (active-low:
+ * 0 = pressed) and report changes since the last reading.
+ */
+static void lxio_in_completed(struct urb *urb)
+{
+	struct piuio *piu = urb->context;
+	unsigned long changed[PIUIO_MSG_LONGS];
+	int i;
+	int b;
+	int ret = urb->status;
+
+	if (ret) {
+		dev_warn(&piu->udev->dev, "lxio callback(in): error %d\n", ret);
+		goto resubmit;
+	}
+
+	/* Note what has changed, then store the inputs for next time */
+	for (i = 0; i < PIUIO_MSG_LONGS; i++) {
+		changed[i] = piu->inputs[i] ^ piu->old_inputs[0][i];
+		piu->old_inputs[0][i] = piu->inputs[i];
+	}
+
+	/* Report changes for each mapped bit */
+	for_each_set_bit(b, changed, piu->type->inputs) {
+		int kc = lxio_keycode(b);
+
+		if (!kc)
+			continue;
+		input_event(piu->idev, EV_MSC, MSC_SCAN, b + 1);
+		input_report_key(piu->idev, kc,
+				 !test_bit(b, piu->inputs));
+	}
+	input_sync(piu->idev);
+
+resubmit:
+	ret = usb_submit_urb(urb, GFP_ATOMIC);
+	if (ret == -EPERM)
+		dev_info(&piu->udev->dev, "lxio resubmit(in): shutdown\n");
+	else if (ret)
+		dev_err(&piu->udev->dev, "lxio resubmit(in): error %d\n", ret);
+
+	wake_up(&piu->shutdown_wait);
+}
+
+/*
+ * LXIO OUT interrupt completion
+ *
+ * After sending the lamp output report, advance multiplexer (no-op for
+ * LXIO since mplex=1) and resubmit.
+ */
+static void lxio_out_completed(struct urb *urb)
+{
+	struct piuio *piu = urb->context;
+	int ret = urb->status;
+
+	if (ret) {
+		dev_warn(&piu->udev->dev, "lxio callback(out): error %d\n", ret);
+		goto resubmit;
+	}
+
+	/* Copy staged outputs */
+	memcpy(piu->outputs, piu->new_outputs, piu->type->msg_sz);
+
+	/* Advance multiplexer (no-op for LXIO) */
+	piu->set = (piu->set + 1) % piu->type->mplex;
+
+resubmit:
+	ret = usb_submit_urb(piu->out, GFP_ATOMIC);
+	if (ret == -EPERM)
+		dev_info(&piu->udev->dev, "lxio resubmit(out): shutdown\n");
+	else if (ret)
+		dev_err(&piu->udev->dev, "lxio resubmit(out): error %d\n", ret);
+
 	wake_up(&piu->shutdown_wait);
 }
 
@@ -364,7 +526,7 @@ static void piuio_led_set(struct led_classdev *dev, enum led_brightness b)
 	int n;
 
 	n = led - piu->led;
-	if (n > piu->type->outputs) {
+	if (n >= piu->type->outputs) {
 		dev_err(&piu->udev->dev, "piuio led: bad number %d\n", n);
 		return;
 	}
@@ -386,7 +548,7 @@ static void piuio_input_init(struct piuio *piu, struct device *parent)
 	int i;
 
 	/* Fill in basic fields */
-	idev->name = "PIUIO input";
+	idev->name = piu->is_lxio ? "LXIO input" : "PIUIO input";
 	idev->phys = piu->phys;
 	usb_to_input_id(piu->udev, &idev->id);
 	idev->dev.parent = parent;
@@ -398,8 +560,16 @@ static void piuio_input_init(struct piuio *piu, struct device *parent)
 	set_bit(EV_ABS, idev->evbit);
 
 	/* Configure buttons */
-	for (i = 0; i < piu->type->inputs; i++)
-		set_bit(keycode(i), idev->keybit);
+	if (piu->is_lxio) {
+		for (i = 0; i < piu->type->inputs; i++) {
+			int kc = lxio_keycode(i);
+			if (kc)
+				set_bit(kc, idev->keybit);
+		}
+	} else {
+		for (i = 0; i < piu->type->inputs; i++)
+			set_bit(keycode(i), idev->keybit);
+	}
 	clear_bit(0, idev->keybit);
 
 	/* Configure fake axes */
@@ -463,7 +633,7 @@ static void piuio_leds_destroy(struct piuio *piu)
 }
 
 static int piuio_init(struct piuio *piu, struct input_dev *idev,
-		struct usb_device *udev)
+		struct usb_device *udev, struct usb_interface *intf)
 {
 	/* Note: if this function returns an error, piuio_destroy will still be
 	 * called, so we don't need to clean up here */
@@ -497,25 +667,65 @@ static int piuio_init(struct piuio *piu, struct input_dev *idev,
 	usb_make_path(udev, piu->phys, sizeof(piu->phys));
 	strlcat(piu->phys, "/input0", sizeof(piu->phys));
 
-	/* Prepare URB for multiplexer and outputs */
-	piu->cr_out.bRequestType = USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE;
-	piu->cr_out.bRequest = cpu_to_le16(PIUIO_MSG_REQ);
-	piu->cr_out.wValue = cpu_to_le16(PIUIO_MSG_VAL);
-	piu->cr_out.wIndex = cpu_to_le16(PIUIO_MSG_IDX);
-	piu->cr_out.wLength = cpu_to_le16(PIUIO_MSG_SZ);
-	usb_fill_control_urb(piu->out, udev, usb_sndctrlpipe(udev, 0),
-			(void *) &piu->cr_out, piu->outputs, PIUIO_MSG_SZ,
-			piuio_out_completed, piu);
+	/* Prepare URBs depending on device type */
+	if (piu->is_lxio) {
+		/* LXIO: discover HID interrupt endpoints dynamically */
+		struct usb_host_interface *alt = intf->cur_altsetting;
+		struct usb_endpoint_descriptor *ep_in = NULL, *ep_out = NULL;
+		int i;
 
-	/* Prepare URB for inputs */
-	piu->cr_in.bRequestType = USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE;
-	piu->cr_in.bRequest = cpu_to_le16(PIUIO_MSG_REQ);
-	piu->cr_in.wValue = cpu_to_le16(PIUIO_MSG_VAL);
-	piu->cr_in.wIndex = cpu_to_le16(PIUIO_MSG_IDX);
-	piu->cr_in.wLength = cpu_to_le16(PIUIO_MSG_SZ);
-	usb_fill_control_urb(piu->in, udev, usb_rcvctrlpipe(udev, 0),
-			(void *) &piu->cr_in, piu->inputs, PIUIO_MSG_SZ,
-			piuio_in_completed, piu);
+		for (i = 0; i < alt->desc.bNumEndpoints; i++) {
+			struct usb_endpoint_descriptor *ep = &alt->endpoint[i].desc;
+			if (!ep_in && usb_endpoint_is_int_in(ep))
+				ep_in = ep;
+			else if (!ep_out && usb_endpoint_is_int_out(ep))
+				ep_out = ep;
+		}
+
+		if (!ep_in || !ep_out) {
+			dev_err(&udev->dev, "lxio init: missing interrupt endpoints\n");
+			return -ENODEV;
+		}
+
+		if (usb_endpoint_maxp(ep_in) > PIUIO_MAX_MSG_SZ ||
+		    usb_endpoint_maxp(ep_out) > PIUIO_MAX_MSG_SZ) {
+			dev_err(&udev->dev,
+				"lxio init: endpoint size exceeds buffer (%d)\n",
+				PIUIO_MAX_MSG_SZ);
+			return -ENODEV;
+		}
+
+		usb_fill_int_urb(piu->out, udev,
+				usb_sndintpipe(udev, usb_endpoint_num(ep_out)),
+				piu->outputs, usb_endpoint_maxp(ep_out),
+				lxio_out_completed, piu,
+				ep_out->bInterval);
+
+		usb_fill_int_urb(piu->in, udev,
+				usb_rcvintpipe(udev, usb_endpoint_num(ep_in)),
+				piu->inputs, usb_endpoint_maxp(ep_in),
+				lxio_in_completed, piu,
+				ep_in->bInterval);
+	} else {
+		/* PIUIO: use vendor control transfers */
+		piu->cr_out.bRequestType = USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE;
+		piu->cr_out.bRequest = cpu_to_le16(PIUIO_MSG_REQ);
+		piu->cr_out.wValue = cpu_to_le16(PIUIO_MSG_VAL);
+		piu->cr_out.wIndex = cpu_to_le16(PIUIO_MSG_IDX);
+		piu->cr_out.wLength = cpu_to_le16(PIUIO_MSG_SZ);
+		usb_fill_control_urb(piu->out, udev, usb_sndctrlpipe(udev, 0),
+				(void *) &piu->cr_out, piu->outputs, PIUIO_MSG_SZ,
+				piuio_out_completed, piu);
+
+		piu->cr_in.bRequestType = USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE;
+		piu->cr_in.bRequest = cpu_to_le16(PIUIO_MSG_REQ);
+		piu->cr_in.wValue = cpu_to_le16(PIUIO_MSG_VAL);
+		piu->cr_in.wIndex = cpu_to_le16(PIUIO_MSG_IDX);
+		piu->cr_in.wLength = cpu_to_le16(PIUIO_MSG_SZ);
+		usb_fill_control_urb(piu->in, udev, usb_rcvctrlpipe(udev, 0),
+				(void *) &piu->cr_in, piu->inputs, PIUIO_MSG_SZ,
+				piuio_in_completed, piu);
+	}
 
 	return 0;
 }
@@ -549,8 +759,14 @@ static int piuio_probe(struct usb_interface *intf,
 		return ret;
 	}
 
-	if (id->idVendor == USB_VENDOR_ID_BTNBOARD &&
-			id->idProduct == USB_PRODUCT_ID_BTNBOARD) {
+	if (id->idVendor == USB_VENDOR_ID_LXIO &&
+	    (id->idProduct == USB_PRODUCT_ID_LXIO_V1 ||
+	     id->idProduct == USB_PRODUCT_ID_LXIO_V2)) {
+		/* LXIO V1/V2 HID device */
+		piu->type = &piuio_dev_lxio;
+		piu->is_lxio = true;
+	} else if (id->idVendor == USB_VENDOR_ID_BTNBOARD &&
+		   id->idProduct == USB_PRODUCT_ID_BTNBOARD) {
 		/* Button board card */
 		piu->type = &piuio_dev_bb;
 	} else {
@@ -568,7 +784,7 @@ static int piuio_probe(struct usb_interface *intf,
 	}
 
 	/* Initialize PIUIO state and input device */
-	ret = piuio_init(piu, idev, udev);
+	ret = piuio_init(piu, idev, udev, intf);
 	if (ret)
 		goto err;
 
@@ -625,6 +841,10 @@ static struct usb_device_id piuio_id_table[] = {
 	{ USB_DEVICE(USB_VENDOR_ID_ANCHOR, USB_PRODUCT_ID_PYTHON2) },
 	/* Special USB ID for button board devices */
 	{ USB_DEVICE(USB_VENDOR_ID_BTNBOARD, USB_PRODUCT_ID_BTNBOARD) },
+	/* LXIO V1 HID device */
+	{ USB_DEVICE(USB_VENDOR_ID_LXIO, USB_PRODUCT_ID_LXIO_V1) },
+	/* LXIO V2 HID device */
+	{ USB_DEVICE(USB_VENDOR_ID_LXIO, USB_PRODUCT_ID_LXIO_V2) },
 	{},
 };
 
@@ -638,8 +858,8 @@ static struct usb_driver piuio_driver = {
 };
 
 MODULE_AUTHOR("Devin J. Pohly");
-MODULE_DESCRIPTION("PIUIO input/output driver");
-MODULE_VERSION("1.0");
+MODULE_DESCRIPTION("PIUIO / LXIO input/output driver");
+MODULE_VERSION("1.1");
 MODULE_LICENSE("GPL");
 
 module_usb_driver(piuio_driver);
