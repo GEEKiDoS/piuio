@@ -253,25 +253,27 @@ static int keycode(unsigned int pin)
 /*
  * LXIO keycode mapping
  *
- * The LXIO 16-byte HID report uses active-low signaling. Several byte
- * positions are duplicates or unused, so we skip them to avoid reporting
- * duplicate key events or events from stale data.
+ * The LXIO 16-byte HID report uses active-low signaling. Each panel
+ * button position has 4 independent sensors (bytes 0-3 for P1, 4-7 for
+ * P2).  lxio_in_completed ANDs each 4-sensor bank together so that a
+ * button registers as pressed when ANY sensor triggers.  After merging,
+ * bytes 1-3 hold the same value as byte 0 and bytes 5-7 hold the same
+ * value as byte 4 -- we skip bits 8-31 and 40-63 here to avoid
+ * reporting duplicate key events.
  *
- * Meaningful byte positions:
+ * Meaningful byte positions (after sensor merging):
  *   Byte 0  (bits 0-7):   Pad 1 panel sensors
  *   Byte 4  (bits 32-39):  Pad 2 panel sensors
  *   Byte 8  (bits 64-71):  Pad 1 coin/aux
  *   Byte 9  (bits 72-79):  Pad 2 coin/aux
  *   Bytes 10-11 (bits 80-95):  Front buttons
  *
- * Duplicate/unused:
- *   Bytes 1-3   (bits 8-31):    Duplicate of byte 0 (maybe history data?)
- *   Bytes 5-7   (bits 40-63):   Duplicate of byte 4 (^)
+ * Unused:
  *   Bytes 12-15 (bits 96+):     Unused/stale
  */
 static int lxio_keycode(unsigned int pin)
 {
-	/* Skip duplicate bytes 1-3, 5-7 and unused bytes 12-15 */
+	/* Skip redundant sensor bytes 1-3, 5-7 and unused bytes 12-15 */
 	if ((pin >= 8 && pin < 32) ||
 	    (pin >= 40 && pin < 64) ||
 	    pin >= 96)
@@ -390,11 +392,17 @@ resubmit:
  *
  * Extract button states from the 16-byte HID input report (active-low:
  * 0 = pressed) and report changes since the last reading.
+ *
+ * The real LXIO hardware has 4 independent sensors per panel button,
+ * sent as 4 identical byte positions (bytes 0-3 for P1, 4-7 for P2).
+ * We AND the 4 bytes together: in active-low logic, a button is
+ * pressed when ANY of the 4 sensors reads 0.
  */
 static void lxio_in_completed(struct urb *urb)
 {
 	struct piuio *piu = urb->context;
 	unsigned long changed[PIUIO_MSG_LONGS];
+	unsigned long merged[PIUIO_MSG_LONGS];
 	int i;
 	int b;
 	int ret = urb->status;
@@ -404,10 +412,19 @@ static void lxio_in_completed(struct urb *urb)
 		goto resubmit;
 	}
 
-	/* Note what has changed, then store the inputs for next time */
+	/* Merge 4-sensor banks by ANDing bytes (active-low: 0=pressed,
+	 * so AND means "pressed if any sensor triggers") */
+	memcpy(merged, piu->inputs, sizeof(merged));
+	{
+		u8 *m = (u8 *)merged;
+		m[0] = m[1] = m[2] = m[3] = m[0] & m[1] & m[2] & m[3];
+		m[4] = m[5] = m[6] = m[7] = m[4] & m[5] & m[6] & m[7];
+	}
+
+	/* Note what has changed against the previous merged state */
 	for (i = 0; i < PIUIO_MSG_LONGS; i++) {
-		changed[i] = piu->inputs[i] ^ piu->old_inputs[0][i];
-		piu->old_inputs[0][i] = piu->inputs[i];
+		changed[i] = merged[i] ^ piu->old_inputs[0][i];
+		piu->old_inputs[0][i] = merged[i];
 	}
 
 	/* Report changes for each mapped bit */
@@ -418,7 +435,7 @@ static void lxio_in_completed(struct urb *urb)
 			continue;
 		input_event(piu->idev, EV_MSC, MSC_SCAN, b + 1);
 		input_report_key(piu->idev, kc,
-				 !test_bit(b, piu->inputs));
+				 !test_bit(b, merged));
 	}
 	input_sync(piu->idev);
 
