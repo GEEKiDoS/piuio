@@ -1,7 +1,7 @@
 PIUIO input driver for Linux
 ============================
 
-This is a driver for the PIUIO arcade I/O board that maps panels and buttons to
+This is a driver for the PIUIO/LXIO arcade I/O board that maps panels and buttons to
 a standard Linux event interface which typically appears as a joystick.
 
 
@@ -32,6 +32,16 @@ Note: during this step, you may see the following error:
 Unless you are trying to build a cryptographically signed module, you may
 safely ignore these messages.
 
+Note for LXIO
+-----------------
+You need to add a quirk for `usbhid` driver to prevent usbhid driver taking over the LXIO device which is preventing this driver to work, in `/etc/modprobe.d` create a new conf file with:
+```
+options usbhid quirks=0xd2f:0x1020:0x0004,0xd2f:0x1040:0x0004
+```
+
+And the regenerate the initramfs, for Arch Linux use `mkinitcpio -P`.
+
+Lights in LXIO are not tested and may not works.
 
 Tools for testing
 -----------------
