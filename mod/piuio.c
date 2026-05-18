@@ -189,22 +189,33 @@ static const char *bbled_names[] = {
 };
 
 static const char *lxio_led_names[] = {
-	"piuio::lamp0",
-	"piuio::lamp1",
-	"piuio::lamp2",
-	"piuio::lamp3",
-	"piuio::lamp4",
-	"piuio::lamp5",
-	"piuio::lamp6",
-	"piuio::lamp7",
-	"piuio::lamp8",
-	"piuio::lamp9",
-	"piuio::lamp10",
-	"piuio::lamp11",
-	"piuio::lamp12",
-	"piuio::lamp13",
-	"piuio::lamp14",
-	"piuio::lamp15",
+	"piuio::p1_lu",
+	"piuio::p1_ru",
+	"piuio::p1_cn",
+	"piuio::p1_ld",
+	"piuio::p1_rd",
+	"piuio::p2_lu",
+	"piuio::p2_ru",
+	"piuio::p2_cn",
+	"piuio::p2_ld",
+	"piuio::p2_rd",
+	"piuio::bass",
+	"piuio::halo_r2",
+	"piuio::halo_r1",
+	"piuio::halo_l2",
+	"piuio::halo_l1",
+	"piuio::coin_counter",
+	"piuio::coin_counter2",
+	"piuio::p1_lu_menu",
+	"piuio::p1_ru_menu",
+	"piuio::p1_cn_menu",
+	"piuio::p1_ld_menu",
+	"piuio::p1_rd_menu",
+	"piuio::p2_lu_menu",
+	"piuio::p2_ru_menu",
+	"piuio::p2_cn_menu",
+	"piuio::p2_ld_menu",
+	"piuio::p2_rd_menu",
 };
 
 /* Full device parameters */
@@ -470,7 +481,7 @@ static void lxio_out_completed(struct urb *urb)
 
 	/* Advance multiplexer (no-op for LXIO) */
 	piu->set = (piu->set + 1) % piu->type->mplex;
-
+	
 resubmit:
 	ret = usb_submit_urb(piu->out, GFP_ATOMIC);
 	if (ret == -EPERM)
@@ -606,8 +617,6 @@ static void piuio_input_init(struct piuio *piu, struct device *parent)
 static int piuio_leds_init(struct piuio *piu)
 {
 	int i;
-	const struct attribute_group **ag;
-	struct attribute **attr;
 	int ret;
 
 	for (i = 0; i < piu->type->outputs; i++) {
@@ -620,18 +629,6 @@ static int piuio_leds_init(struct piuio *piu)
 		ret = led_classdev_register(&piu->udev->dev, &piu->led[i].dev);
 		if (ret)
 			goto out_unregister;
-
-		/* Relax permissions on led attributes */
-		for (ag = piu->led[i].dev.dev->class->dev_groups; *ag; ag++) {
-			for (attr = (*ag)->attrs; *attr; attr++) {
-				ret = sysfs_chmod_file(&piu->led[i].dev.dev->kobj,
-						*attr, S_IRUGO | S_IWUGO);
-				if (ret) {
-					led_classdev_unregister(&piu->led[i].dev);
-					goto out_unregister;
-				}
-			}
-		}
 	}
 
 	return 0;
